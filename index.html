@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Digi-Hand GIS | The Digitalization of Motion</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #020617; font-family: 'Segoe UI', sans-serif; }
+        #map-container { position: relative; height: 100vh; width: 100vw; }
+        .map-layer { position: absolute; top: 0; left: 0; height: 100%; width: 100%; transition: filter 0.4s; }
+        
+        /* Indicators */
+        #status-bar {
+            position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+            z-index: 1000; background: rgba(15, 23, 42, 0.9);
+            padding: 10px 25px; border-radius: 50px; border: 1px solid rgba(255,255,255,0.2);
+            backdrop-filter: blur(12px); display: flex; gap: 15px; color: white;
+        }
+        .indicator { padding: 5px 12px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; background: #1e293b; opacity: 0.4; }
+        .active { opacity: 1; background: #0ea5e9; box-shadow: 0 0 15px #0ea5e9; }
+        .clear-active { background: #ef4444 !important; opacity: 1 !important; }
+
+        /* Modern Legend */
+        #gesture-legend {
+            position: absolute; bottom: 20px; right: 20px; z-index: 1000;
+            background: rgba(15, 23, 42, 0.85); padding: 15px; border-radius: 15px; 
+            border: 1px solid rgba(255,255,255,0.1); color: white; width: 230px;
+        }
+        .legend-item { display: flex; align-items: center; margin-bottom: 8px; gap: 10px; font-size: 0.8rem; }
+        .legend-icon { width: 32px; height: 32px; background: #334155; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 1.1rem; }
+
+        /* Video & Digitalization Overlay */
+        #video-wrapper { position: fixed; bottom: 20px; left: 20px; width: 200px; height: 150px; border-radius: 12px; border: 2px solid #0ea5e9; z-index: 1000; overflow: hidden; background: black; }
+        video { width: 100%; height: 100%; transform: scaleX(-1); object-fit: cover; }
+        #canvas-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
+        
+        #v-cursor { 
+            width: 24px; height: 24px; border: 2px white solid; border-radius: 50%; 
+            position: fixed; pointer-events: none; z-index: 9999; 
+            transform: translate(-50%, -50%); background: rgba(14, 165, 233, 0.3);
+            transition: all 0.1s ease-out;
+        }
+
+        #map-satellite { z-index: 2; clip-path: circle(150px at center); pointer-events: none; }
+        .measure-tooltip { position: fixed; background: #0ea5e9; color: white; padding: 4px 10px; border-radius: 5px; font-size: 13px; font-weight: bold; pointer-events: none; z-index: 10000; transform: translate(25px, -25px); }
+    </style>
+</head>
+<body>
+
+<div id="status-bar">
+    <div id="ind-measure" class="indicator">📏 MEASURE</div>
+    <div id="ind-draw" class="indicator">✍️ DRAW</div>
+    <div id="ind-zoom" class="indicator">🔍 ZOOM</div>
+    <div id="ind-clear" class="indicator">🗑️ CLEAR</div>
+</div>
+
+<div id="gesture-legend">
+    <div style="font-weight: bold; margin-bottom: 10px; color: #94a3b8; font-size: 0.75rem; letter-spacing: 1px;">DIGITALIZATION GUIDE</div>
+    <div class="legend-item"><div class="legend-icon">✋</div><span><b>Hover:</b> Digital Measure</span></div>
+    <div class="legend-item"><div class="legend-icon">🤏</div><span><b>Pinch:</b> Create Node</span></div>
+    <div class="legend-item"><div class="legend-icon">✌️</div><span><b>Spread:</b> Smooth Zoom</span></div>
+    <div class="legend-item"><div class="legend-icon">✊</div><span><b>Fist:</b> Wipe Data (1s)</span></div>
+</div>
+
+<div id="measure-val" class="measure-tooltip" style="display:none;">0m</div>
+<div id="v-cursor"></div>
+
+<div id="video-wrapper">
+    <video class="input_video"></video>
+    <canvas id="canvas-overlay"></canvas>
+</div>
+
+<div id="map-container">
+    <div id="map-base" class="map-layer"></div>
+    <div id="map-satellite" class="map-layer"></div>
+</div>
+
+<script>
+    const mapBase = L.map('map-base', { zoomControl: false, zoomSnap: 0.1 }).setView([40.7128, -74.0060], 15);
+    const mapSat = L.map('map-satellite', { zoomControl: false, attributionControl: false }).setView([40.7128, -74.0060], 15);
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(mapBase);
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}').addTo(mapSat);
+
+    mapBase.on('move', () => mapSat.setView(mapBase.getCenter(), mapBase.getZoom(), { animate: false }));
+
+    const drawLayer = L.featureGroup().addTo(mapBase);
+    let activePoints = [], activeShape = null;
+    let liveLine = L.polyline([], {color: '#f59e0b', weight: 3, dashArray: '8, 8'}).addTo(mapBase);
+    let isPinching = false, lastZoomDist = null, currentZoom = 15, fistFrames = 0;
+
+    const cursor = document.getElementById('v-cursor'), satLayer = document.getElementById('map-satellite'), measureTooltip = document.getElementById('measure-val');
+    const canvasCtx = document.getElementById('canvas-overlay').getContext('2d');
+
+    function onResults(results) {
+        // Draw Digitalization Skeleton
+        canvasCtx.clearRect(0, 0, 200, 150);
+        if (results.multiHandLandmarks) {
+            for (const landmarks of results.multiHandLandmarks) {
+                landmarks.forEach(pt => {
+                    canvasCtx.fillStyle = "#0ea5e9";
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(pt.x * 200, pt.y * 150, 2.5, 0, 2 * Math.PI);
+                    canvasCtx.fill();
+                });
+            }
+        }
+
+        if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+            updateUI(null); return;
+        }
+
+        const hand = results.multiHandLandmarks[0];
+        const index = hand[8], thumb = hand[4], middle = hand[12], ring = hand[16], pinky = hand[20];
+        const x = (1 - index.x) * window.innerWidth, y = index.y * window.innerHeight;
+
+        cursor.style.left = `${x}px`; cursor.style.top = `${y}px`;
+        satLayer.style.clipPath = `circle(150px at ${x}px ${y}px)`;
+
+        const pinchDist = Math.hypot(index.x - thumb.x, index.y - thumb.y);
+        const zoomDist = Math.hypot(index.x - middle.x, index.y - middle.y);
+        const isFist = (index.y > hand[6].y && middle.y > hand[10].y && ring.y > hand[14].y && pinky.y > hand[18].y);
+
+        if (isFist) {
+            fistFrames++; updateUI('ind-clear');
+            if (fistFrames > 35) { clearDrawings(); fistFrames = 0; }
+            return;
+        } else { fistFrames = 0; }
+
+        if (zoomDist > 0.16) {
+            updateUI('ind-zoom');
+            if (lastZoomDist) {
+                currentZoom = Math.min(Math.max(currentZoom + (zoomDist - lastZoomDist) * 7, 2), 20);
+                mapBase.setZoom(currentZoom);
+            }
+            lastZoomDist = zoomDist; measureTooltip.style.display = 'none';
+        } 
+        else if (pinchDist < 0.035) {
+            updateUI('ind-draw');
+            lastZoomDist = null;
+            if (!isPinching) {
+                isPinching = true;
+                addPoint(mapBase.containerPointToLatLng([x, y]));
+            }
+            measureTooltip.style.display = 'none';
+        } 
+        else {
+            updateUI('ind-measure');
+            lastZoomDist = null; isPinching = false;
+            if (activePoints.length > 0) {
+                const lastPt = activePoints[activePoints.length - 1];
+                const currentPt = mapBase.containerPointToLatLng([x, y]);
+                liveLine.setLatLngs([lastPt, currentPt]);
+                const dist = lastPt.distanceTo(currentPt);
+                measureTooltip.style.display = 'block'; measureTooltip.style.left = `${x}px`; measureTooltip.style.top = `${y}px`;
+                measureTooltip.innerText = dist > 1000 ? (dist/1000).toFixed(2) + 'km' : Math.round(dist) + 'm';
+            }
+        }
+    }
+
+    function addPoint(latLng) {
+        activePoints.push(latLng);
+        L.circleMarker(latLng, { radius: 5, color: '#fff', weight: 2, fillColor: '#0ea5e9', fillOpacity: 1 }).addTo(drawLayer);
+        if (activeShape) drawLayer.removeLayer(activeShape);
+        if (activePoints.length === 2) {
+            activeShape = L.polyline(activePoints, { color: '#0ea5e9', weight: 4 }).addTo(drawLayer);
+        } else if (activePoints.length > 2) {
+            activeShape = L.polygon(activePoints, { color: '#0ea5e9', weight: 4, fillColor: '#0ea5e9', fillOpacity: 0.25 }).addTo(drawLayer);
+        }
+    }
+
+    function clearDrawings() {
+        drawLayer.clearLayers(); activePoints = []; activeShape = null;
+        liveLine.setLatLngs([]); measureTooltip.style.display = 'none';
+    }
+
+    function updateUI(id) {
+        document.querySelectorAll('.indicator').forEach(el => el.classList.remove('active', 'clear-active'));
+        if (id) {
+            const el = document.getElementById(id);
+            el.classList.add(id === 'ind-clear' ? 'clear-active' : 'active');
+        }
+    }
+
+    const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.8 });
+    hands.onResults(onResults);
+    new Camera(document.querySelector('.input_video'), {
+        onFrame: async () => { await hands.send({image: document.querySelector('.input_video')}); },
+        width: 640, height: 480
+    }).start();
+</script>
+</body>
+</html>
