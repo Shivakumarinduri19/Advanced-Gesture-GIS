@@ -5,7 +5,7 @@
 ---
 
 ## 🚀 Live Experience
-[**Launch the Live Demo**](INSERT_YOUR_GITHUB_PAGES_LINK_HERE)
+[**Launch the Live Demo**](https://shivakumarinduri19.github.io/Digi-Hand-GIS/)
 
 ---
 
